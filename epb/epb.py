@@ -6,6 +6,7 @@ import docker
 from json import dumps, loads
 import requests
 import gzip
+import re
 
 
 cwd = getcwd()
@@ -19,13 +20,13 @@ basedir = "%s/sysdig-probe-builder" % (cwd)
 @click.option('-k', '--dir-kernels', default="%s/kernels" % (basedir), show_default=True, help="DON'T CHANGE")
 @click.option('-s', '--dir-sysdig', default="%s/sysdig" % (basedir), show_default=True, help="DON'T CHANGE")
 @click.option('-d', '--docker-sock', default="/var/run/docker.sock", show_default=True, help="DON'T CONANGE THIS UNLESS YOU ARE SURE - builder needs access to docker.sock")
-@click.option('-V', '--agent-version', default="10.3.0", show_default=True, help="sysdig agent version") 
+@click.option('-a', '--agent-version', default="10.3.0", show_default=True, help="sysdig agent version") 
 @click.option('-u', '--uname', default="4.4.0-186-generic", show_default=True, help="uname -r from the nodes")
 @click.option('-m', '--mirror', default="http://security.ubuntu.com/ubuntu/", show_default=True, help="Debian file repo")
 @click.option('-U', '--ubuntu-version', default="20.04", show_default=True, help="Ubuntu version")
+@click.option('-p', '--push-docker', default=False, show_default=True, help="Push all image builds to docker repo")
 
-
-def build(registry, repo, basedir, dir_workspace, dir_kernels, dir_sysdig, docker_sock, agent_version, uname, mirror, ubuntu_version):
+def build(registry, repo, basedir, dir_workspace, dir_kernels, dir_sysdig, docker_sock, agent_version, uname, mirror, ubuntu_version, push_docker):
 
     ubuntu_names =   {"14.04": "trusty",
                     "16.04": "xenial",
@@ -36,7 +37,7 @@ def build(registry, repo, basedir, dir_workspace, dir_kernels, dir_sysdig, docke
 
     def dirs_create():
         mkdirs = [basedir]
-        dirs = [dir_workspace, dir_kernels, dir_sysdig, ubuntu_name]
+        dirs = [dir_workspace, dir_kernels, dir_sysdig]
         for dir in dirs:
             mkdirs.append(path.join(basedir,dir))
         for makedir in mkdirs:
@@ -49,17 +50,15 @@ def build(registry, repo, basedir, dir_workspace, dir_kernels, dir_sysdig, docke
 
     
     def sysdig_git():
-        dir_sysdig = "/Users/ericlugo/Work/epb/epb/sysdig-probe-builder/sysdig" # make these var outside
-        system("rm -rf %s" % (dir_sysdig))
         try:
             repo = Repo.clone_from("https://github.com/draios/sysdig", dir_sysdig, branch="agent-release-%s" % (agent_version))
         except Exception as error:
             print("ERROR: %s" % (error.status))
 
-    client = docker.DockerClient(base_url='unix:/%s ' % (docker_sock))
+    client = docker.DockerClient(base_url='unix:/%s' % (docker_sock))
 
     def docker_image_build(registry, repo, tag, dir):
-        imagetag = path.join(registry, '') + repo + ":" + tag
+        imagetag = registry + repo + ":" + tag
         build = client.images.build(path=dir, tag=imagetag)
         print("LOG: %s" % (build[0]))
         for log in build[1]:
@@ -70,6 +69,11 @@ def build(registry, repo, basedir, dir_workspace, dir_kernels, dir_sysdig, docke
         repo = path.join(registry, '') + repo
         push = client.images.push(repository=repo, tag=tag)
         print(push)
+
+    def docker_run_probe_builder(registry, repo, tag, volumes, agent_version):
+        imagetag = registry + repo + ":" + tag
+        command = "-B -- -p sysdigcloud-probe -v %s -k CustomUbuntu" % (agent_version)
+        run = client.containers.run(imagetag, command, volumes=volumes)
 
     def packages_file_downloader(ubuntu_name):
         '''Downloads the Packages files for the ubuntu distro'''
@@ -82,8 +86,10 @@ def build(registry, repo, basedir, dir_workspace, dir_kernels, dir_sysdig, docke
 
     def search_packages(packages_file):
         package_links = []
-        for package in ["linux-image-%s" % (uname), "linux-modules-%s" % (uname), "linux-headers-%s" % (uname), "linux-image-4.4.0-186"]:
+        headers_dep = re.search('\d+.\d+.\d+-\d+', uname)[0]
+        for package in ["linux-image-%s" % (uname), "linux-modules-%s" % (uname), "linux-headers-%s" % (uname), "linux-headers-%s" %(headers_dep)]:
             with gzip.open(packages_file, 'rt') as infile:
+                print("searching gzip")
                 found = False                
                 for line in infile:
                     if "Package: %s" % (package) in line:
@@ -107,14 +113,16 @@ def build(registry, repo, basedir, dir_workspace, dir_kernels, dir_sysdig, docke
 
     # dirs_create()
     # sysdig_git()
-    # probe_builder = path.join(basedir, dir_sysdig, 'probe-builder')
-    # docker_image_build(registry, repo, "latest", probe_builder) # make these var
-    # docker_image_push(registry, repo, "latest")
-    # package_links = search_packages()
-    # download_packages(mirror, dir_kernels, package_links)
-    # packages_file_downloader(ubuntu_name)
-    packages_file = path.join(dir_workspace, ubuntu_name, "Packages.gz")
-    package_links = search_packages(packages_file)
-    download_packages("http://security.ubuntu.com/", package_links, dir_kernels)
+    probe_builder = path.join(basedir, dir_sysdig, 'probe-builder')
+    docker_image_build(registry, repo, "latest", probe_builder) # make these var
+    # if push_docker:
+    #     docker_image_push(registry, repo, "latest")
+    # # download_packages(mirror, dir_kernels, package_links)
+    # # packages_file_downloader(ubuntu_name)
+    # packages_file = path.join(cwd, "files" , ubuntu_name, "Packages.gz")
+    # package_links = search_packages(packages_file)
+    # download_packages("http://security.ubuntu.com/", package_links, dir_kernels)
+    volumes = {docker_sock: {"bind": "/var/run/docker.sock"}, dir_workspace: {"bind": "/workspace"}, dir_sysdig: {"bind": "/sysdig"}, dir_kernels: {"bind": "/kernels"}}
+    docker_run_probe_builder(registry, repo, "latest", volumes, agent_version)
 if __name__ == '__main__':
     build()
